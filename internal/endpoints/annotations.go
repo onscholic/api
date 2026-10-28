@@ -1,0 +1,698 @@
+package endpoints
+
+import (
+	"context"
+	"encoding/base64"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"scholic/internal/database"
+	feedlog "scholic/internal/feed"
+	"scholic/internal/limits"
+	"scholic/internal/models"
+	"scholic/internal/scraper"
+	"scholic/internal/services/media"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+// CreateAnnotationRequest is the JSON body for creating a new annotation.
+type CreateAnnotationRequest struct {
+	URL                  string `json:"url" binding:"required"`
+	Selectors            string `json:"selectors" binding:"required"`
+	Text                 string `json:"text"`
+	QuoteText            string `json:"quoteText"`
+	IsPrivate            bool   `json:"isPrivate"`
+	Type                 string `json:"type"`           // text, image, html, etc.
+	Image                string `json:"image"`          // base64 encoded image data (for type="image")
+	PDFHash              string `json:"pdfHash"`        // Digital fingerprint of the PDF
+	PDFPage              int    `json:"pdfPage"`        // Page number within the PDF
+	HighlightColor       string `json:"highlightColor"` // User-chosen pastel highlight color (hex)
+	LinkPreviewImageMode string `json:"linkPreviewImageMode"`
+	CollectionID         *uint  `json:"collectionId"`
+}
+
+// CreateAnnotation handles POST /api/annotations
+//
+// Creates a new annotation for the authenticated user. The request body must
+// include the URL and selectors (JSON string). Text and QuoteText are optional.
+//
+// The selectors field contains the anchoring data needed to re-find the
+// annotation on the page after a reload. It's stored as-is (JSON string)
+// in the database's JSONB column.
+func CreateAnnotation(c *gin.Context) {
+	// Get the authenticated user's ID from the middleware context
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var req CreateAnnotationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := validateMentionCount(req.Text); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !isValidLinkPreviewImageMode(req.LinkPreviewImageMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid linkPreviewImageMode"})
+		return
+	}
+	if req.CollectionID != nil {
+		var collection models.Collection
+		if err := database.DB.Where("id = ? AND owner_id = ?", *req.CollectionID, userID.(uint)).First(&collection).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Collection not found"})
+			return
+		}
+	}
+	req.URL = canonicalAnnotationURL(req.URL)
+
+	// Scrape metadata for rich link previews
+	var linkTitle, linkDesc, linkImage, linkFavicon, linkDomain string
+	meta, err := scraper.ExtractMetadata(req.URL)
+	if err == nil && meta != nil {
+		linkTitle = meta.Title
+		linkDesc = meta.Description
+		linkImage = meta.Image
+		linkFavicon = meta.Favicon
+		linkDomain = meta.Domain
+	} else { // Fallback if scrape fails
+		if parsedURL, parseErr := url.Parse(req.URL); parseErr == nil {
+			linkDomain = strings.TrimPrefix(parsedURL.Host, "www.")
+		}
+	}
+
+	// Handle image upload if type is image and image data is provided
+	var imageUrl string
+	if req.Type == "image" && req.Image != "" {
+		// Expecting data:image/png;base64,... format
+		parts := strings.Split(req.Image, ",")
+		if len(parts) == 2 {
+			base64Data := parts[1]
+			// Reject obviously oversized payloads before paying the
+			// allocation/CPU cost of a full base64 decode. Base64 inflates by
+			// ~4/3, so this slightly over-allows but never under-rejects.
+			if len(base64Data) > (limits.MaxImageAnnotationBytes*4/3)+8 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Image too large. Maximum size is 5MB"})
+				return
+			}
+			data, err := base64.StdEncoding.DecodeString(base64Data)
+			if err == nil {
+				if len(data) > limits.MaxImageAnnotationBytes {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Image too large. Maximum size is 5MB"})
+					return
+				}
+				// Upload to R2
+				r2 := media.GetR2Service()
+				// Construct a pseudo-multipart header for the name/type
+				filename := "screenshot.png"
+				res, uploadErr := r2.UploadBytes(c.Request.Context(), data, filename, "image/png", "annotations")
+				if uploadErr == nil {
+					imageUrl = res.URL
+				} else {
+					// Log the error (can't using logging package here easily without import)
+					// fmt.Printf("[Scholic] R2 upload failed: %v\n", uploadErr)
+				}
+			}
+		}
+	}
+
+	highlightColor := req.HighlightColor
+	if highlightColor == "" {
+		highlightColor = "#A8D5B5"
+	}
+
+	annotation := models.Annotation{
+		UserID:               userID.(uint),
+		URL:                  req.URL,
+		Selectors:            req.Selectors,
+		Text:                 req.Text,
+		QuoteText:            req.QuoteText,
+		IsPrivate:            req.IsPrivate,
+		Type:                 req.Type,
+		ImageURL:             imageUrl,
+		PDFHash:              req.PDFHash,
+		PDFPage:              req.PDFPage,
+		LinkTitle:            linkTitle,
+		LinkDescription:      linkDesc,
+		LinkImage:            linkImage,
+		LinkPreviewImageMode: normalizeLinkPreviewImageMode(req.LinkPreviewImageMode),
+		LinkFavicon:          linkFavicon,
+		LinkDomain:           linkDomain,
+		HighlightColor:       highlightColor,
+	}
+
+	if err := database.DB.Create(&annotation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create annotation"})
+		return
+	}
+
+	// Reload with user data
+	if err := database.DB.Preload("User").First(&annotation, annotation.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Annotation created but failed to reload"})
+		return
+	}
+	if req.CollectionID != nil {
+		if err := AddAnnotationToCollection(c, annotation.UserID, *req.CollectionID, annotation.ID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Annotation created but failed to add to collection"})
+			return
+		}
+	}
+	created := []models.Annotation{annotation}
+	models.ResolveLinkPreviewImageVisibility(created)
+	annotation = created[0]
+
+	// Invalidate caches — annotations for this URL, and (only for public annotations)
+	// ALL recently-read pages for this user and all feed caches.
+	// Private annotations never affect the recently-read or feed surfaces.
+	username := annotation.User.Username
+	annotationURL := req.URL
+	isPublic := !annotation.IsPrivate
+	if isPublic {
+		notifyMentionedUsers(annotation.UserID, annotation.Text, uintPtr(annotation.ID), nil, "")
+		notifySharedDocAnnotators(annotation.UserID, annotation.ID, annotation.URL, annotation.Text)
+	}
+	feedlog.CreateEventAsync(feedlog.EventInput{
+		ActorID:    annotation.UserID,
+		Type:       models.FeedEventAnnotationCreated,
+		TargetType: models.FeedTargetAnnotation,
+		TargetID:   annotation.ID,
+		IsPrivate:  annotation.IsPrivate,
+	})
+	go func() {
+		ctx := context.Background()
+		database.CacheDelete(ctx, database.AnnotationsURLKey(annotationURL))
+		if isPublic {
+			if username != "" {
+				database.CacheDeletePattern(ctx, database.RecentlyReadKeyPattern(username))
+			}
+			database.CacheDeletePattern(ctx, database.FeedKeyPattern())
+		}
+	}()
+
+	c.JSON(http.StatusCreated, annotation)
+}
+
+// GetAnnotations handles GET /api/annotations?url=<url>
+//
+// Returns all annotations for a given URL. If the user is authenticated,
+// returns both their private highlights and public annotations.
+// If not authenticated, returns only public annotations.
+//
+// The URL query parameter is required and must match exactly.
+func GetAnnotations(c *gin.Context) {
+	url := c.Query("url")
+	if url == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url query parameter is required"})
+		return
+	}
+	url = canonicalAnnotationURL(url)
+
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if err != nil || limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+
+	var annotations []models.Annotation
+	var total int64
+
+	userID, exists := c.Get("userID")
+
+	var query *gorm.DB
+	if exists {
+		query = database.DB.Model(&models.Annotation{}).Where(
+			"(user_id = ? AND url = ?) OR (url = ? AND is_private = ?)",
+			userID, url, url, false,
+		)
+	} else {
+		query = database.DB.Model(&models.Annotation{}).Where(
+			"url = ? AND is_private = ?", url, false,
+		)
+	}
+
+	query.Count(&total)
+	query.Preload("User").Preload("Comments").Preload("Comments.User").
+		Order("created_at DESC").Limit(limit).Offset(offset).Find(&annotations)
+
+	populateReactions(c, annotations)
+	models.ResolveLinkPreviewImageVisibility(annotations)
+
+	c.JSON(http.StatusOK, gin.H{
+		"annotations": annotations,
+		"total":       total,
+		"limit":       limit,
+		"offset":      offset,
+	})
+}
+
+// DeleteAnnotation handles DELETE /api/annotations/:id
+//
+// Deletes an annotation by ID. Only the owner can delete their annotations.
+func DeleteAnnotation(c *gin.Context) {
+	// Get the authenticated user's ID
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Parse annotation ID from URL parameter
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid annotation ID"})
+		return
+	}
+
+	// Find the annotation and verify ownership
+	var annotation models.Annotation
+	if err := database.DB.First(&annotation, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Annotation not found"})
+		return
+	}
+
+	if annotation.UserID != userID.(uint) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only delete your own annotations"})
+		return
+	}
+
+	// Soft delete (GORM soft delete via DeletedAt)
+	if err := database.DB.Delete(&annotation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete annotation"})
+		return
+	}
+
+	// Invalidate caches — same surfaces as CreateAnnotation.
+	// Only public annotation deletions affect recently-read and feed caches.
+	// Capture needed values before the goroutine runs (annotation may be GC'd).
+	deletedURL := annotation.URL
+	deletedUserID := annotation.UserID
+	deletedIsPublic := !annotation.IsPrivate
+	if err := feedlog.DeleteEvents(c.Request.Context(), models.FeedEventAnnotationCreated, models.FeedTargetAnnotation, annotation.ID); err != nil {
+		// The annotation is already deleted; keep the request successful and
+		// let the feed endpoint filter missing targets if cleanup fails.
+	}
+	go func() {
+		ctx := context.Background()
+		database.CacheDelete(ctx, database.AnnotationsURLKey(deletedURL))
+		if deletedIsPublic {
+			var user models.User
+			if err := database.DB.Select("username").First(&user, deletedUserID).Error; err == nil && user.Username != "" {
+				database.CacheDeletePattern(ctx, database.RecentlyReadKeyPattern(user.Username))
+			}
+			database.CacheDeletePattern(ctx, database.FeedKeyPattern())
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"message": "Annotation deleted"})
+}
+
+type UpdateAnnotationRequest struct {
+	Text                 string `json:"text"`
+	HighlightColor       string `json:"highlightColor"`
+	LinkPreviewImageMode string `json:"linkPreviewImageMode"`
+}
+
+// UpdateAnnotation handles PUT /api/annotations/:id
+func UpdateAnnotation(c *gin.Context) {
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid annotation ID"})
+		return
+	}
+
+	var annotation models.Annotation
+	if err := database.DB.First(&annotation, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Annotation not found"})
+		return
+	}
+
+	if annotation.UserID != userID.(uint) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only edit your own annotations"})
+		return
+	}
+	previousText := annotation.Text
+
+	var req UpdateAnnotationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := validateMentionCount(req.Text); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.LinkPreviewImageMode != "" && !isValidLinkPreviewImageMode(req.LinkPreviewImageMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid linkPreviewImageMode"})
+		return
+	}
+
+	annotation.Text = req.Text
+	if req.HighlightColor != "" {
+		annotation.HighlightColor = req.HighlightColor
+	}
+	if req.LinkPreviewImageMode != "" {
+		annotation.LinkPreviewImageMode = normalizeLinkPreviewImageMode(req.LinkPreviewImageMode)
+	}
+	if err := database.DB.Save(&annotation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update annotation"})
+		return
+	}
+
+	if err := database.DB.Preload("User").First(&annotation, annotation.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Updated but failed to reload"})
+		return
+	}
+	updated := []models.Annotation{annotation}
+	models.ResolveLinkPreviewImageVisibility(updated)
+	annotation = updated[0]
+
+	if !annotation.IsPrivate {
+		notifyMentionedUsers(annotation.UserID, annotation.Text, uintPtr(annotation.ID), nil, previousText)
+	}
+
+	c.JSON(http.StatusOK, annotation)
+}
+
+// GetAnnotation handles GET /api/annotations/:id
+func GetAnnotation(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid annotation ID"})
+		return
+	}
+
+	var annotation models.Annotation
+	if err := database.DB.Preload("User").Preload("Comments", func(db *gorm.DB) *gorm.DB {
+		return db.Order("created_at ASC")
+	}).Preload("Comments.User").First(&annotation, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Annotation not found"})
+		return
+	}
+
+	// If private, only the owner can see it
+	if annotation.IsPrivate {
+		userID, exists := c.Get("userID")
+		if !exists || userID.(uint) != annotation.UserID {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Annotation not found"})
+			return
+		}
+	}
+
+	// Set comment count
+	var commentCount int64
+	database.DB.Model(&models.Comment{}).Where("annotation_id = ?", annotation.ID).Count(&commentCount)
+	annotation.CommentCount = commentCount
+
+	// Reuse the slice helper on a one-element slice so single-fetch reads
+	// surface the same shape as list reads.
+	one := []models.Annotation{annotation}
+	populateReactions(c, one)
+	models.ResolveLinkPreviewImageVisibility(one)
+	annotation = one[0]
+
+	c.JSON(http.StatusOK, annotation)
+}
+
+type FeedEventResponse struct {
+	ID         uint               `json:"id"`
+	Type       string             `json:"type"`
+	TargetType string             `json:"targetType"`
+	TargetID   uint               `json:"targetId"`
+	CreatedAt  time.Time          `json:"createdAt"`
+	Actor      models.User        `json:"actor"`
+	Annotation *models.Annotation `json:"annotation,omitempty"`
+	Bookmark   *models.Bookmark   `json:"bookmark,omitempty"`
+	Document   *DocumentResponse  `json:"document,omitempty"`
+	TargetUser *models.User       `json:"targetUser,omitempty"`
+}
+
+// GetFeed handles GET /api/feed.
+//
+// tab=following (default): public activity from authors the viewer follows.
+// tab=mine: the viewer's own activity, including private events.
+// Targets are hydrated server-side so clients can render mixed feed cards.
+func GetFeed(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "20")
+	offsetStr := c.DefaultQuery("offset", "0")
+	tab := c.DefaultQuery("tab", "following")
+
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	offset, err := strconv.Atoi(offsetStr)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Sign in to view your feed"})
+		return
+	}
+
+	var total int64
+	var query *gorm.DB
+	if tab == "mine" {
+		query = database.DB.Model(&models.FeedEvent{}).
+			Where("actor_id = ?", userID)
+	} else {
+		query = database.DB.Model(&models.FeedEvent{}).
+			Where("feed_events.is_private = ?", false).
+			Joins("JOIN follows ON follows.following_id = feed_events.actor_id").
+			Where("follows.follower_id = ?", userID)
+	}
+
+	query.Count(&total)
+
+	var events []models.FeedEvent
+	query.Preload("Actor").
+		Order("feed_events.created_at DESC").Limit(limit).Offset(offset).Find(&events)
+
+	responses := hydrateFeedEvents(c, events)
+
+	c.JSON(http.StatusOK, gin.H{
+		"events": responses,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+func hydrateFeedEvents(c *gin.Context, events []models.FeedEvent) []FeedEventResponse {
+	annotationIDs := make([]uint, 0)
+	bookmarkIDs := make([]uint, 0)
+	documentIDs := make([]uint, 0)
+	userIDs := make([]uint, 0)
+	for _, event := range events {
+		switch event.TargetType {
+		case models.FeedTargetAnnotation:
+			annotationIDs = append(annotationIDs, event.TargetID)
+		case models.FeedTargetBookmark:
+			bookmarkIDs = append(bookmarkIDs, event.TargetID)
+		case models.FeedTargetDocument:
+			documentIDs = append(documentIDs, event.TargetID)
+		case models.FeedTargetUser:
+			userIDs = append(userIDs, event.TargetID)
+		}
+	}
+
+	annotationsByID := map[uint]models.Annotation{}
+	if len(annotationIDs) > 0 {
+		var annotations []models.Annotation
+		database.DB.Preload("User").
+			Preload("Comments", func(db *gorm.DB) *gorm.DB {
+				return db.Order("created_at ASC").Limit(5)
+			}).
+			Preload("Comments.User").
+			Where("id IN ?", annotationIDs).
+			Find(&annotations)
+		commentCounts := batchCommentCounts(annotationIDs)
+		populateReactions(c, annotations)
+		models.ResolveLinkPreviewImageVisibility(annotations)
+		for i := range annotations {
+			annotations[i].CommentCount = commentCounts[annotations[i].ID]
+			annotationsByID[annotations[i].ID] = annotations[i]
+		}
+	}
+
+	bookmarksByID := map[uint]models.Bookmark{}
+	if len(bookmarkIDs) > 0 {
+		var bookmarks []models.Bookmark
+		database.DB.Where("id IN ?", bookmarkIDs).Find(&bookmarks)
+		for _, bookmark := range bookmarks {
+			bookmarksByID[bookmark.ID] = bookmark
+		}
+	}
+
+	documentsByID := map[uint]DocumentResponse{}
+	if len(documentIDs) > 0 {
+		var documents []models.Document
+		database.DB.Preload("User").Where("id IN ?", documentIDs).Find(&documents)
+		for _, document := range documents {
+			documentsByID[document.ID] = formatDocument(document)
+		}
+	}
+
+	usersByID := map[uint]models.User{}
+	if len(userIDs) > 0 {
+		var users []models.User
+		database.DB.Where("id IN ?", userIDs).Find(&users)
+		for _, user := range users {
+			usersByID[user.ID] = user
+		}
+	}
+
+	out := make([]FeedEventResponse, 0, len(events))
+	for _, event := range events {
+		item := FeedEventResponse{
+			ID:         event.ID,
+			Type:       event.Type,
+			TargetType: event.TargetType,
+			TargetID:   event.TargetID,
+			CreatedAt:  event.CreatedAt,
+			Actor:      event.Actor,
+		}
+		switch event.TargetType {
+		case models.FeedTargetAnnotation:
+			target, ok := annotationsByID[event.TargetID]
+			if !ok {
+				continue
+			}
+			item.Annotation = &target
+		case models.FeedTargetBookmark:
+			target, ok := bookmarksByID[event.TargetID]
+			if !ok {
+				continue
+			}
+			item.Bookmark = &target
+		case models.FeedTargetDocument:
+			target, ok := documentsByID[event.TargetID]
+			if !ok {
+				continue
+			}
+			item.Document = &target
+		case models.FeedTargetUser:
+			target, ok := usersByID[event.TargetID]
+			if !ok {
+				continue
+			}
+			item.TargetUser = &target
+		default:
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// GetSitePage handles GET /api/site?url=...&author=...&timeRange=...
+//
+// Returns all public annotations for a given URL with optional author and
+// time range filters. Also returns the list of all annotators on that URL
+// so the frontend can build the author filter dropdown.
+func GetSitePage(c *gin.Context) {
+	urlStr := c.Query("url")
+	if urlStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url query parameter is required"})
+		return
+	}
+	urlStr = canonicalAnnotationURL(urlStr)
+
+	authors := c.QueryArray("author") // ?author=user1&author=user2
+	timeRange := c.DefaultQuery("timeRange", "all")
+
+	userID, exists := c.Get("userID")
+
+	// Step 1: get all unique annotators on this URL for the filter UI
+	var allForURL []models.Annotation
+	database.DB.Model(&models.Annotation{}).Preload("User").
+		Where("url = ? AND is_private = ?", urlStr, false).
+		Find(&allForURL)
+
+	seen := map[string]bool{}
+	var authorList []string
+	for _, a := range allForURL {
+		if a.User.Username != "" && !seen[a.User.Username] {
+			seen[a.User.Username] = true
+			authorList = append(authorList, a.User.Username)
+		}
+	}
+	if authorList == nil {
+		authorList = []string{}
+	}
+
+	// Step 2: build filtered query
+	query := database.DB.Model(&models.Annotation{}).Preload("User").Where("annotations.url = ?", urlStr)
+
+	if exists {
+		query = query.Where("(annotations.user_id = ? OR annotations.is_private = ?)", userID, false)
+	} else {
+		query = query.Where("annotations.is_private = ?", false)
+	}
+
+	if len(authors) > 0 {
+		var authorIDs []uint
+		database.DB.Model(&models.User{}).Where("username IN ?", authors).Pluck("id", &authorIDs)
+		if len(authorIDs) == 0 {
+			c.JSON(http.StatusOK, gin.H{"annotations": []models.Annotation{}, "authors": authorList, "total": 0})
+			return
+		}
+		query = query.Where("annotations.user_id IN ?", authorIDs)
+	}
+
+	now := time.Now()
+	switch timeRange {
+	case "today":
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		query = query.Where("annotations.created_at >= ?", start)
+	case "week":
+		query = query.Where("annotations.created_at >= ?", now.AddDate(0, 0, -7))
+	case "month":
+		query = query.Where("annotations.created_at >= ?", now.AddDate(0, -1, 0))
+	}
+
+	var annotations []models.Annotation
+	query.Order("annotations.created_at ASC").Find(&annotations)
+
+	// Batch comment counts
+	annotationIDs := make([]uint, len(annotations))
+	for i, a := range annotations {
+		annotationIDs[i] = a.ID
+	}
+	commentCounts := batchCommentCounts(annotationIDs)
+	for i := range annotations {
+		annotations[i].CommentCount = commentCounts[annotations[i].ID]
+	}
+
+	populateReactions(c, annotations)
+	models.ResolveLinkPreviewImageVisibility(annotations)
+
+	c.JSON(http.StatusOK, gin.H{
+		"annotations": annotations,
+		"authors":     authorList,
+		"total":       len(annotations),
+	})
+}
